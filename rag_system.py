@@ -47,7 +47,7 @@ if uploaded_file:
                 
                 @st.cache_resource
                 def load_ocr():
-                    return easyocr.Reader(['bn', 'en'], gpu=False, download_enabled=True, model_storage_directory=model_dir, user_network_directory=model_dir)
+                    return easyocr.Reader(['bn', 'en'], gpu=False, download_enabled=True, model_storage_directory=model_dir, user_network_directory=model_dir, verbose=False)
                 reader = load_ocr()
                 status.update(label="✅ EasyOCR model loaded!", state="complete", expanded=False)
             except Exception as e:
