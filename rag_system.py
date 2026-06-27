@@ -57,10 +57,23 @@ if uploaded_file:
         # Step 2: Load embedding model
         with st.status("📊 Loading embedding model (first time may take a few minutes)...", expanded=True) as status:
             try:
-                from langchain_community.embeddings import HuggingFaceEmbeddings
+                from sentence_transformers import SentenceTransformer
+                from langchain_core.embeddings import Embeddings
+                import numpy as np
+                
+                class LocalEmbeddings(Embeddings):
+                    def __init__(self, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+                        self.model = SentenceTransformer(model_name)
+                    
+                    def embed_documents(self, texts):
+                        return self.model.encode(texts).tolist()
+                    
+                    def embed_query(self, text):
+                        return self.model.encode(text).tolist()
+                
                 @st.cache_resource
                 def load_embeddings():
-                    return HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+                    return LocalEmbeddings()
                 embeddings = load_embeddings()
                 status.update(label="✅ Embedding model loaded!", state="complete", expanded=False)
             except Exception as e:
