@@ -1,253 +1,322 @@
 import streamlit as st
 import numpy as np
 import os
-from PIL import Image
-import shutil
-from collections import defaultdict
 import sys
-import io
+from PIL import Image
+import tempfile
 
-# Fix Windows encoding issue
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+# Set ALL environment variables BEFORE ANYTHING ELSE
+script_dir = os.path.dirname(os.path.abspath(__file__))
+easyocr_dir = os.path.join(script_dir, "easyocr_models")
+os.makedirs(easyocr_dir, exist_ok=True)
+os.environ["EASYOCR_MODULE_PATH"] = easyocr_dir
+os.environ["HOME"] = script_dir
+os.environ["USERPROFILE"] = script_dir
+os.environ["PYTHONIOENCODING"] = "utf-8"
 
-# Set page config FIRST!
-st.set_page_config(page_title="Local Multilingual RAG", layout="wide")
+st.set_page_config(page_title="Local Multilingual RAG", layout="wide", page_icon="📄")
 
-# App title and basic UI
+# Clear cache button
+if st.button("🔄 Clear All Cache"):
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    st.success("Cache cleared! Please refresh the page.")
+
+# ── Custom CSS ──────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main { background-color: #0f1117; }
+    .stTextArea textarea { font-family: monospace; font-size: 13px; }
+    .log-box {
+        background: #1a1d27; border-left: 3px solid #00d4aa;
+        padding: 10px 14px; border-radius: 4px;
+        font-family: monospace; font-size: 12px;
+        color: #c8fae8; margin: 4px 0;
+    }
+    .metric-box {
+        background: #1a1d27; border: 1px solid #2a2d3a;
+        padding: 12px; border-radius: 8px; text-align: center;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("📄 Local OCR & Dynamic RAG System")
+st.caption("Bangla + English | Fully Local | No External APIs")
 st.markdown("---")
 
-# Sidebar: Manual Metadata Filters
+# ── Sidebar: Metadata Filters ────────────────────────────────────────────────
 st.sidebar.header("⚙️ Manual Metadata Filters")
+st.sidebar.markdown("Enable filters to narrow the search scope.")
+
+doc_date   = st.sidebar.date_input("📅 Document Date")
+doc_type   = st.sidebar.selectbox("📁 Document Type", ["Official", "Personal", "Invoice", "Letter", "Academic", "News"])
+doc_lang   = st.sidebar.radio("🌐 Document Language", ["Bangla", "English", "Mixed"])
+
 st.sidebar.markdown("---")
-doc_date = st.sidebar.date_input("Document Date")
-doc_type = st.sidebar.selectbox("Document Type", ["Official", "Personal", "Invoice", "Letter"])
-doc_lang = st.sidebar.radio("Document Language", ["Bangla", "English", "Mixed"])
+st.sidebar.subheader("🔍 Active Filters")
+use_date_filter = st.sidebar.checkbox("Filter by Date",     value=False)
+use_type_filter = st.sidebar.checkbox("Filter by Doc Type", value=False)
+use_lang_filter = st.sidebar.checkbox("Filter by Language", value=True)
 
-uploaded_file = st.file_uploader("📤 Upload Scanned Document (PDF/JPG/PNG)", type=['png', 'jpg', 'jpeg', 'pdf'])
+# ── File Upload ──────────────────────────────────────────────────────────────
+uploaded_file = st.file_uploader(
+    "📤 Upload Scanned Document (PDF / JPG / PNG)",
+    type=["png", "jpg", "jpeg", "pdf"]
+)
 
-# Clear ChromaDB directory
+# ── Cached model loaders ─────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False, ttl=0, max_entries=1)
+def load_ocr_v4():
+    import easyocr
+    return easyocr.Reader(
+        ["bn", "en"], 
+        gpu=False, 
+        verbose=False, 
+        model_storage_directory=easyocr_dir,
+        user_network_directory=easyocr_dir
+    )
+
+@st.cache_resource(show_spinner=False)
+def load_embeddings():
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def log(msg: str):
+    st.markdown(f'<div class="log-box">▶ {msg}</div>', unsafe_allow_html=True)
+
+def pdf_to_images(file_bytes: bytes):
+    import pdf2image
+    return pdf2image.convert_from_bytes(file_bytes)
+
+def ocr_image(reader, img) -> str:
+    arr = np.array(img)
+    results = reader.readtext(arr, detail=1)
+    lines, confidences = [], []
+    for (_, text, conf) in results:
+        lines.append(text)
+        confidences.append(conf)
+    avg_conf = round(sum(confidences) / len(confidences) * 100, 1) if confidences else 0
+    return " ".join(lines), avg_conf
+
+# ── Chroma helpers (no .persist() — auto-persists in newer chromadb) ─────────
 CHROMA_DIR = "./chroma_db"
-if os.path.exists(CHROMA_DIR):
-    shutil.rmtree(CHROMA_DIR)
 
+def get_vectorstore(embeddings):
+    from langchain_community.vectorstores import Chroma
+    return Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+
+def add_to_vectorstore(chunks, metadatas, embeddings):
+    from langchain_community.vectorstores import Chroma
+    Chroma.from_texts(
+        chunks,
+        embeddings,
+        metadatas=metadatas,
+        persist_directory=CHROMA_DIR,
+    )
+
+# ── Main flow ─────────────────────────────────────────────────────────────────
 if uploaded_file:
-    st.success(f"✅ Uploaded: {uploaded_file.name}")
-    
-    # Now load all the heavy stuff only when needed!
-    try:
-        # Step 1: Load OCR model
-        with st.status("🔍 Loading EasyOCR model (first time may take a few minutes)...", expanded=True) as status:
-            try:
-                import easyocr
-                # Create a local model directory in the project folder
-                model_dir = os.path.join(os.getcwd(), "easyocr_models")
-                os.makedirs(model_dir, exist_ok=True)
-                
-                @st.cache_resource
-                def load_ocr():
-                    return easyocr.Reader(['bn', 'en'], gpu=False, download_enabled=True, model_storage_directory=model_dir, user_network_directory=model_dir, verbose=False)
-                reader = load_ocr()
-                status.update(label="✅ EasyOCR model loaded!", state="complete", expanded=False)
-            except Exception as e:
-                status.update(label=f"❌ Error loading OCR: {str(e)}", state="error", expanded=True)
-                st.stop()
-        
-        # Step 2: Load embedding model
-        with st.status("📊 Loading embedding model (first time may take a few minutes)...", expanded=True) as status:
-            try:
-                from sentence_transformers import SentenceTransformer
-                from langchain_core.embeddings import Embeddings
-                import numpy as np
-                
-                class LocalEmbeddings(Embeddings):
-                    def __init__(self, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
-                        self.model = SentenceTransformer(model_name)
-                    
-                    def embed_documents(self, texts):
-                        return self.model.encode(texts).tolist()
-                    
-                    def embed_query(self, text):
-                        return self.model.encode(text).tolist()
-                
-                @st.cache_resource
-                def load_embeddings():
-                    return LocalEmbeddings()
-                embeddings = load_embeddings()
-                status.update(label="✅ Embedding model loaded!", state="complete", expanded=False)
-            except Exception as e:
-                status.update(label=f"❌ Error loading embeddings: {str(e)}", state="error", expanded=True)
-                st.stop()
-        
-        # Step 3: Display the document
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            st.subheader("📄 Uploaded Document")
-            if uploaded_file.type == "application/pdf":
-                with st.spinner("Loading PDF..."):
-                    import pdf2image
-                    images = pdf2image.convert_from_bytes(uploaded_file.read())
-                    st.image(images[0], caption="First Page of PDF", use_column_width=True)
-                    uploaded_file.seek(0)
-            else:
-                image = Image.open(uploaded_file)
-                st.image(image, caption="Uploaded Image", use_column_width=True)
-        
-        # Step 4: Extract text
-        with col2:
-            with st.status("� Extracting text using OCR...", expanded=True) as status:
-                try:
-                    extracted_text = ""
-                    if uploaded_file.type == "application/pdf":
-                        import pdf2image
-                        images = pdf2image.convert_from_bytes(uploaded_file.read())
-                        for i, img in enumerate(images):
-                            status.write(f"Processing page {i+1}/{len(images)}")
-                            image_np = np.array(img)
-                            results = reader.readtext(image_np, detail=0)
-                            extracted_text += " ".join(results) + "\n\n"
-                    else:
-                        image = Image.open(uploaded_file)
-                        image_np = np.array(image)
-                        results = reader.readtext(image_np, detail=0)
-                        extracted_text = " ".join(results)
-                    
-                    status.update(label="✅ Text extraction complete!", state="complete", expanded=False)
-                    st.subheader("📝 Extracted Text")
-                    st.text_area("", extracted_text, height=300)
-                except Exception as e:
-                    status.update(label=f"❌ Error extracting text: {str(e)}", state="error", expanded=True)
-                    st.stop()
-            
-            # Step 5: Chunk and index
-            with st.status("🧩 Chunking and indexing document...", expanded=True) as status:
-                try:
-                    from langchain_text_splitters import RecursiveCharacterTextSplitter
-                    from langchain_community.vectorstores import Chroma
-                    from rank_bm25 import BM25Okapi
-                    
-                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-                    chunks = text_splitter.split_text(extracted_text)
-                    status.write(f"Created {len(chunks)} chunks")
-                    
-                    metadatas = [{"date": str(doc_date), "type": doc_type, "lang": doc_lang} for _ in chunks]
-                    
-                    # Initialize ChromaDB (without persist which is deprecated)
-                    vectorstore = Chroma.from_texts(
-                        chunks, 
-                        embeddings, 
-                        metadatas=metadatas, 
-                        persist_directory=CHROMA_DIR
-                    )
-                    
-                    # Initialize BM25 for keyword search
-                    tokenized_chunks = [chunk.lower().split() for chunk in chunks]
-                    bm25 = BM25Okapi(tokenized_chunks)
-                    status.write("BM25 index created")
-                    
-                    status.update(label="✅ Document indexed successfully!", state="complete", expanded=False)
-                    st.info("Hybrid search (BM25 + vector) is now active!")
-                except Exception as e:
-                    status.update(label=f"❌ Error indexing: {str(e)}", state="error", expanded=True)
-                    st.stop()
-        
-        # Step 6: RAG query
-        st.markdown("---")
-        query = st.text_input("💬 Ask a question about the document:")
-        
-        if query:
-            with st.status("🤖 Generating answer with hybrid search...", expanded=True) as status:
-                try:
-                    from langchain_community.llms import Ollama
-                    from langchain_core.prompts import PromptTemplate
-                    from langchain_core.documents import Document
-                    
-                    llm = Ollama(model="llama3")
-                    
-                    # Step 1: BM25 Keyword Search
-                    tokenized_query = query.lower().split()
-                    bm25_scores = bm25.get_scores(tokenized_query)
-                    
-                    # Step 2: Vector Search with filters
-                    filtered_chroma_results = vectorstore.similarity_search_with_score(
-                        query,
-                        k=10,
-                        filter={
-                            'date': str(doc_date),
-                            'type': doc_type,
-                            'lang': doc_lang
-                        }
-                    )
-                    
-                    # Step 3: Get chunk indices for BM25 that match metadata
-                    bm25_chunk_indices = []
-                    for i, meta in enumerate(metadatas):
-                        if (meta['date'] == str(doc_date) and 
-                            meta['type'] == doc_type and 
-                            meta['lang'] == doc_lang):
-                            bm25_chunk_indices.append(i)
-                    
-                    # Step 4: Combine scores using Reciprocal Rank Fusion (RRF)
-                    rrf_scores = defaultdict(float)
-                    k = 60  # RRF constant
-                    
-                    # Process ChromaDB results (sorted by similarity)
-                    for rank, (doc, score) in enumerate(filtered_chroma_results):
-                        chunk_idx = chunks.index(doc.page_content)
-                        rrf_scores[chunk_idx] += 1 / (k + rank + 1)
-                    
-                    # Process BM25 results (filter and sort top 10)
-                    filtered_bm25 = [(i, bm25_scores[i]) for i in bm25_chunk_indices]
-                    filtered_bm25.sort(key=lambda x: x[1], reverse=True)
-                    for rank, (i, score) in enumerate(filtered_bm25[:10]):
-                        rrf_scores[i] += 1 / (k + rank + 1)
-                    
-                    # Step 5: Get top chunks based on RRF
-                    sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-                    top_chunk_indices = [i for i, _ in sorted_rrf[:5]]
-                    
-                    # Create documents for the chain
-                    final_docs = [
-                        Document(page_content=chunks[i], metadata=metadatas[i]) 
-                        for i in top_chunk_indices
-                    ]
-                    
-                    # Show source info
-                    with st.expander("🔍 Hybrid Search Details"):
-                        st.write("Top chunks from BM25 + Vector combination:")
-                        for i, idx in enumerate(top_chunk_indices):
-                            st.markdown(f"**Chunk {i+1}** (RRF Score: {rrf_scores[idx]:.4f})")
-                            st.write(chunks[idx][:200] + "...")
-                    
-                    # Create prompt and generate answer
-                    prompt = PromptTemplate.from_template(
-                        """Answer the following question based only on the provided context:
+    st.success(f"✅ Uploaded: **{uploaded_file.name}**  ({uploaded_file.size/1024:.1f} KB)")
 
-<context>
+    # Load models
+    with st.spinner("⏳ Loading OCR model (first run downloads ~150 MB)…"):
+        try:
+            reader = load_ocr_v4()
+            log("EasyOCR loaded — languages: Bangla (bn) + English (en)")
+        except Exception as e:
+            st.error(f"❌ Error loading OCR: {e}")
+            import traceback
+            st.error(traceback.format_exc())
+            st.stop()
+
+    with st.spinner("⏳ Loading embedding model…"):
+        try:
+            embeddings = load_embeddings()
+            log("Embedding model loaded — paraphrase-multilingual-MiniLM-L12-v2")
+        except Exception as e:
+            st.error(f"❌ Error loading embeddings: {e}")
+            st.stop()
+
+    file_bytes = uploaded_file.read()
+    is_pdf     = uploaded_file.type == "application/pdf"
+
+    # Convert to images
+    with st.spinner("📄 Converting document…"):
+        if is_pdf:
+            images = pdf_to_images(file_bytes)
+            log(f"PDF converted → {len(images)} page(s)")
+        else:
+            import io
+            images = [Image.open(io.BytesIO(file_bytes))]
+            log("Image loaded successfully")
+
+    # Show preview + OCR side-by-side
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("📄 Document Preview")
+        st.image(images[0], caption="Page 1", use_container_width=True)
+
+    with col2:
+        st.subheader("📝 OCR Processing Logs")
+        full_text    = ""
+        total_conf   = []
+        char_counts  = []
+
+        for i, img in enumerate(images):
+            with st.spinner(f"🔍 OCR on page {i+1}/{len(images)}…"):
+                page_text, conf = ocr_image(reader, img)
+                full_text      += page_text + "\n\n"
+                total_conf.append(conf)
+                char_counts.append(len(page_text))
+                log(f"Page {i+1}: {len(page_text)} chars | confidence {conf}%")
+
+        avg_conf = round(sum(total_conf) / len(total_conf), 1) if total_conf else 0
+
+        # Metrics
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Characters", f"{sum(char_counts):,}")
+        m2.metric("Pages Processed",  len(images))
+        m3.metric("Avg OCR Confidence", f"{avg_conf}%")
+
+        st.text_area("Extracted Text", full_text.strip(), height=250)
+
+    # Chunk + embed + store
+    st.markdown("---")
+    with st.spinner("🧩 Chunking and indexing into ChromaDB…"):
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks   = splitter.split_text(full_text.strip())
+
+        if not chunks:
+            st.warning("⚠️ No text extracted. Try a clearer image.")
+            st.stop()
+
+        metadatas = [{
+            "date":     str(doc_date),
+            "type":     doc_type,
+            "lang":     doc_lang,
+            "filename": uploaded_file.name,
+        } for _ in chunks]
+
+        add_to_vectorstore(chunks, metadatas, embeddings)
+
+        log(f"Chunked into {len(chunks)} pieces (size=500, overlap=50)")
+        log(f"Metadata saved → date:{doc_date} | type:{doc_type} | lang:{doc_lang}")
+        log(f"Stored in ChromaDB at {CHROMA_DIR}")
+        st.success(f"✅ Indexed **{len(chunks)} chunks** into vector store!")
+
+    # ── RAG Query ─────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("💬 Ask a Question (Bangla বা English)")
+
+    # Show active filters
+    active = []
+    if use_date_filter: active.append(f"Date = {doc_date}")
+    if use_type_filter: active.append(f"Type = {doc_type}")
+    if use_lang_filter: active.append(f"Language = {doc_lang}")
+    if active:
+        st.info("🔍 Active filters: " + " | ".join(active))
+    else:
+        st.info("🔍 No filters active — searching all documents")
+
+    query = st.text_input("Your question:", placeholder="e.g. এই নথিতে কী বলা আছে? / What does this document say?")
+
+    if query:
+        with st.spinner("🤖 Searching and generating answer…"):
+            try:
+                from langchain_community.vectorstores import Chroma
+                from langchain_community.llms import Ollama
+                from langchain_core.prompts import PromptTemplate
+                from langchain.chains.combine_documents import create_stuff_documents_chain
+                from langchain.chains.retrieval import create_retrieval_chain
+
+                vectorstore = get_vectorstore(embeddings)
+
+                # Build filter dict dynamically — only enabled filters
+                filter_dict = {}
+                if use_date_filter: filter_dict["date"] = str(doc_date)
+                if use_type_filter: filter_dict["type"] = doc_type
+                if use_lang_filter: filter_dict["lang"] = doc_lang
+
+                search_kwargs = {"k": 4}
+                if filter_dict:
+                    search_kwargs["filter"] = filter_dict
+
+                log(f"Vector search with filter: {filter_dict if filter_dict else 'none'}")
+
+                retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
+
+                # BM25 hybrid search
+                try:
+                    from langchain_community.retrievers import BM25Retriever
+                    from langchain.retrievers import EnsembleRetriever
+
+                    bm25 = BM25Retriever.from_texts(chunks, metadatas=metadatas)
+                    bm25.k = 4
+                    hybrid_retriever = EnsembleRetriever(
+                        retrievers=[bm25, retriever],
+                        weights=[0.3, 0.7]
+                    )
+                    log("Hybrid search: BM25 (30%) + Vector (70%)")
+                    active_retriever = hybrid_retriever
+                except Exception:
+                    log("BM25 unavailable — using vector-only search")
+                    active_retriever = retriever
+
+                prompt = PromptTemplate.from_template("""
+You are a helpful assistant. Answer the question based ONLY on the context below.
+If the context is in Bangla, answer in Bangla. If English, answer in English.
+If you cannot find the answer in the context, say so honestly.
+
+Context:
 {context}
-</context>
 
 Question: {input}
 
-Answer:"""
-                    )
-                    
-                    # Manually run document chain since we have final_docs
-                    context = "\n\n".join([doc.page_content for doc in final_docs])
-                    response = llm.invoke(prompt.format(context=context, input=query))
-                    
-                    status.update(label="✅ Answer generated!", state="complete", expanded=False)
-                    st.subheader("✅ Answer")
-                    st.markdown(response)
-                    
-                    with st.expander("📚 Source Chunks"):
-                        for i, doc in enumerate(final_docs):
-                            st.markdown(f"**Chunk {i+1}**")
-                            st.write(doc.page_content)
-                            st.markdown("---")
-                except Exception as e:
-                    status.update(label=f"❌ Error with RAG: {str(e)}", state="error", expanded=True)
-                    st.info("Make sure Ollama is running and has llama3: `ollama run llama3`")
-    except Exception as e:
-        st.error(f"Unexpected error: {str(e)}")
+Answer:""")
+
+                llm = Ollama(model="llama3")
+                doc_chain      = create_stuff_documents_chain(llm, prompt)
+                retrieval_chain = create_retrieval_chain(active_retriever, doc_chain)
+                response       = retrieval_chain.invoke({"input": query})
+
+                st.subheader("✅ Answer")
+                st.markdown(f"> {response['answer']}")
+
+                with st.expander("📚 Source Chunks Used"):
+                    for i, doc in enumerate(response.get("context", [])):
+                        st.markdown(f"**Chunk {i+1}**")
+                        st.write(doc.page_content)
+                        st.caption(f"Metadata: {doc.metadata}")
+                        st.markdown("---")
+
+            except Exception as e:
+                err = str(e)
+                if "ollama" in err.lower() or "connection" in err.lower():
+                    st.error("❌ Ollama is not running!")
+                    st.code("ollama pull llama3\nollama run llama3", language="bash")
+                    st.info("Run the above commands in a separate terminal, then try again.")
+                else:
+                    st.error(f"❌ RAG Error: {e}")
+
+else:
+    # Landing state
+    st.markdown("""
+    ### How to use
+    1. **Set metadata** in the left sidebar (date, type, language)
+    2. **Upload** a scanned image or PDF (Bangla / English / Mixed)
+    3. **Watch** OCR extract text locally — no internet needed
+    4. **Ask** any question about the document in Bangla or English
+    5. **Toggle filters** in the sidebar to narrow the search
+    """)
+    st.markdown("---")
+    c1, c2, c3 = st.columns(3)
+    c1.info("🔒 **100% Local**\nNo data leaves your machine")
+    c2.info("🌐 **Bilingual**\nBangla + English OCR")
+    c3.info("🔍 **Hybrid Search**\nBM25 + Vector similarity")

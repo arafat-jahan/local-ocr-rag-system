@@ -168,6 +168,17 @@ If you prefer Docker:
 - **LLM**: Ollama (Llama 3)
 - **Framework**: LangChain
 - **Image Processing**: Pillow, NumPy
+- **PDF Processing**: pdf2image
+
+---
+
+## Windows-specific Fixes
+
+The application includes automatic fixes for common Windows issues:
+
+1. **EasyOCR Path Overrides**: Automatically sets `EASYOCR_MODULE_PATH`, `HOME`, and `USERPROFILE` environment variables to use a local `easyocr_models` directory to avoid permission errors
+2. **UTF-8 Encoding**: Sets `PYTHONIOENCODING` to ensure proper handling of multilingual text
+3. **Streamlit Headless Mode**: Skips email prompt on startup
 
 ---
 
