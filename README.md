@@ -55,16 +55,18 @@ Uses `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
 
 ### 3. Hybrid Search System Architecture
 
-The system combines metadata filtering with vector similarity search:
+The system combines **BM25 keyword search**, **vector similarity search**, and **metadata filtering** to provide the most relevant results:
 
 **Architecture Flow**:
-1. **Metadata Pre-filtering**: Applies strict filters (date, document type, language) before vector search using ChromaDB's filter DSL
-2. **Vector Similarity Search**: Performs semantic search only on filtered documents
-3. **Retrieval Chain**: Uses LangChain's retrieval chain to fetch relevant chunks
-4. **Answer Generation**: Llama 3 generates answers based solely on retrieved context
+1. **Metadata Pre-filtering**: First applies strict filters (date, document type, language) to narrow down the document set
+2. **BM25 Keyword Search**: Uses Okapi BM25 algorithm to find keyword matches in filtered chunks
+3. **Vector Similarity Search**: Performs semantic similarity search using multilingual embeddings on filtered documents
+4. **Reciprocal Rank Fusion (RRF)**: Combines BM25 and vector results using RRF to get the best of both worlds
+5. **Answer Generation**: Llama 3 generates answers based on the top fused chunks
 
 **Key Technologies**:
 - **Vector DB**: ChromaDB
+- **Keyword Search**: BM25Okapi (rank-bm25)
 - **LLM**: Ollama with Llama 3
 - **Framework**: LangChain
 - **UI**: Streamlit

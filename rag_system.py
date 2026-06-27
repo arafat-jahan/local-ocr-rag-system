@@ -3,6 +3,7 @@ import numpy as np
 import os
 from PIL import Image
 import shutil
+from collections import defaultdict, Counter
 
 # Set page config FIRST!
 st.set_page_config(page_title="Local Multilingual RAG", layout="wide")
@@ -41,7 +42,7 @@ if uploaded_file:
         from langchain_community.llms import Ollama
         from langchain_core.prompts import PromptTemplate
         from langchain.chains.combine_documents import create_stuff_documents_chain
-        from langchain.chains.retrieval import create_retrieval_chain
+        from rank_bm25 import BM25Okapi
         
         # Load OCR
         @st.cache_resource
@@ -90,11 +91,13 @@ if uploaded_file:
                 st.text_area("", extracted_text, height=300)
             
             # Chunk and embed
-            with st.spinner("🧩 Indexing into vector DB..."):
+            with st.spinner("🧩 Indexing into vector DB and BM25..."):
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
                 chunks = text_splitter.split_text(extracted_text)
                 
                 metadatas = [{"date": str(doc_date), "type": doc_type, "lang": doc_lang} for _ in chunks]
+                
+                # Initialize ChromaDB
                 vectorstore = Chroma.from_texts(
                     chunks, 
                     embeddings, 
@@ -102,27 +105,80 @@ if uploaded_file:
                     persist_directory=CHROMA_DIR
                 )
                 vectorstore.persist()
+                
+                # Initialize BM25 for keyword search
+                tokenized_chunks = [chunk.lower().split() for chunk in chunks]
+                bm25 = BM25Okapi(tokenized_chunks)
+                
                 st.success("✅ Document indexed! Now ask questions!")
+                st.info("Hybrid search (BM25 + vector) is now active!")
         
         # RAG query
         st.markdown("---")
         query = st.text_input("💬 Ask a question about the document:")
         
         if query:
-            with st.spinner("🤖 Generating answer..."):
+            with st.spinner("🤖 Generating answer with hybrid search..."):
                 try:
                     llm = Ollama(model="llama3")
                     
-                    retriever = vectorstore.as_retriever(
-                        search_kwargs={
-                            'filter': {
-                                'date': str(doc_date),
-                                'type': doc_type,
-                                'lang': doc_lang
-                            }
+                    # Step 1: BM25 Keyword Search
+                    tokenized_query = query.lower().split()
+                    bm25_scores = bm25.get_scores(tokenized_query)
+                    
+                    # Step 2: Vector Search with filters
+                    filtered_chroma_results = vectorstore.similarity_search_with_score(
+                        query,
+                        k=10,
+                        filter={
+                            'date': str(doc_date),
+                            'type': doc_type,
+                            'lang': doc_lang
                         }
                     )
                     
+                    # Step 3: Get chunk indices for BM25 that match metadata
+                    bm25_chunk_indices = []
+                    for i, meta in enumerate(metadatas):
+                        if (meta['date'] == str(doc_date) and 
+                            meta['type'] == doc_type and 
+                            meta['lang'] == doc_lang):
+                            bm25_chunk_indices.append(i)
+                    
+                    # Step 4: Combine scores using Reciprocal Rank Fusion (RRF)
+                    rrf_scores = defaultdict(float)
+                    k = 60  # RRF constant
+                    
+                    # Process ChromaDB results (sorted by similarity)
+                    for rank, (doc, score) in enumerate(filtered_chroma_results):
+                        chunk_idx = chunks.index(doc.page_content)
+                        rrf_scores[chunk_idx] += 1 / (k + rank + 1)
+                    
+                    # Process BM25 results (filter and sort top 10)
+                    filtered_bm25 = [(i, bm25_scores[i]) for i in bm25_chunk_indices]
+                    filtered_bm25.sort(key=lambda x: x[1], reverse=True)
+                    for rank, (i, score) in enumerate(filtered_bm25[:10]):
+                        rrf_scores[i] += 1 / (k + rank + 1)
+                    
+                    # Step 5: Get top chunks based on RRF
+                    sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+                    top_chunk_indices = [i for i, _ in sorted_rrf[:5]]
+                    
+                    # Create documents for the chain
+                    from langchain_core.documents import Document
+                    final_docs = [
+                        Document(page_content=chunks[i], metadata=metadatas[i]) 
+                        for i in top_chunk_indices
+                    ]
+                    
+                    # Show source info
+                    with st.expander("🔍 Hybrid Search Details"):
+                        st.write("Top chunks from BM25 + Vector combination:")
+                        for i, idx in enumerate(top_chunk_indices):
+                            st.markdown(f"**Chunk {i+1}** (RRF Score: {rrf_scores[idx]:.4f})")
+                            st.write(chunks[idx][:200] + "...")
+                    
+                    # Create prompt and chains
                     prompt = PromptTemplate.from_template(
                         """Answer the following question based only on the provided context:
 
@@ -136,14 +192,16 @@ Answer:"""
                     )
                     
                     document_chain = create_stuff_documents_chain(llm, prompt)
-                    retrieval_chain = create_retrieval_chain(retriever, document_chain)
-                    response = retrieval_chain.invoke({"input": query})
+                    
+                    # Manually run document chain since we have final_docs
+                    context = "\n\n".join([doc.page_content for doc in final_docs])
+                    response = llm.invoke(prompt.format(context=context, input=query))
                     
                     st.subheader("✅ Answer")
-                    st.markdown(response['answer'])
+                    st.markdown(response)
                     
                     with st.expander("📚 Source Chunks"):
-                        for i, doc in enumerate(response['context']):
+                        for i, doc in enumerate(final_docs):
                             st.markdown(f"**Chunk {i+1}**")
                             st.write(doc.page_content)
                             st.markdown("---")

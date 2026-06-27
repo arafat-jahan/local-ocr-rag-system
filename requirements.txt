@@ -9,3 +9,4 @@ langchain-core
 chromadb
 sentence-transformers
 pdf2image
+rank-bm25
