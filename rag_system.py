@@ -35,9 +35,13 @@ if uploaded_file:
         with st.status("🔍 Loading EasyOCR model (first time may take a few minutes)...", expanded=True) as status:
             try:
                 import easyocr
+                # Create a local model directory in the project folder
+                model_dir = os.path.join(os.getcwd(), "easyocr_models")
+                os.makedirs(model_dir, exist_ok=True)
+                
                 @st.cache_resource
                 def load_ocr():
-                    return easyocr.Reader(['bn', 'en'], gpu=False, download_enabled=True)
+                    return easyocr.Reader(['bn', 'en'], gpu=False, download_enabled=True, model_storage_directory=model_dir, user_network_directory=model_dir)
                 reader = load_ocr()
                 status.update(label="✅ EasyOCR model loaded!", state="complete", expanded=False)
             except Exception as e:

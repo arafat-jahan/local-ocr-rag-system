@@ -13,8 +13,9 @@ __pycache__/
 *.dll
 *.exe
 
-# Vector store
+# Vector store and OCR models
 chroma_db/
+easyocr_models/
 
 # IDE
 .vscode/
