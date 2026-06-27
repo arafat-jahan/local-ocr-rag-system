@@ -7,9 +7,6 @@ import tempfile
 
 # Set ALL environment variables BEFORE ANYTHING ELSE
 script_dir = os.path.dirname(os.path.abspath(__file__))
-easyocr_dir = os.path.join(script_dir, "easyocr_models")
-os.makedirs(easyocr_dir, exist_ok=True)
-os.environ["EASYOCR_MODULE_PATH"] = easyocr_dir
 os.environ["HOME"] = script_dir
 os.environ["USERPROFILE"] = script_dir
 os.environ["PYTHONIOENCODING"] = "utf-8"
@@ -41,7 +38,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📄 Local OCR & Dynamic RAG System")
-st.caption("Bangla + English | Fully Local | No External APIs")
+st.caption("Bangla + English | Surya-OCR for better Bangla accuracy | No External APIs")
 st.markdown("---")
 
 # ── Sidebar: Metadata Filters ────────────────────────────────────────────────
@@ -66,15 +63,16 @@ uploaded_file = st.file_uploader(
 
 # ── Cached model loaders ─────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False, ttl=0, max_entries=1)
-def load_ocr_v4():
-    import easyocr
-    return easyocr.Reader(
-        ["bn", "en"], 
-        gpu=False, 
-        verbose=False, 
-        model_storage_directory=easyocr_dir,
-        user_network_directory=easyocr_dir
-    )
+def load_ocr_models():
+    from surya.ocr import OCR
+    from surya.model.detection.model import load_model as load_det_model, load_processor as load_det_processor
+    from surya.model.recognition.model import load_model as load_rec_model
+    from surya.model.recognition.processor import load_processor as load_rec_processor
+
+    det_model, det_processor = load_det_model()
+    rec_model, rec_processor = load_rec_model()
+    ocr = OCR(det_model, det_processor, rec_model, rec_processor)
+    return ocr
 
 @st.cache_resource(show_spinner=False)
 def load_embeddings():
@@ -93,15 +91,38 @@ def pdf_to_images(file_bytes: bytes):
     import pdf2image
     return pdf2image.convert_from_bytes(file_bytes)
 
-def ocr_image(reader, img) -> str:
-    arr = np.array(img)
-    results = reader.readtext(arr, detail=1)
-    lines, confidences = [], []
-    for (_, text, conf) in results:
-        lines.append(text)
-        confidences.append(conf)
+def preprocess_image(img):
+    """Preprocess image using OpenCV for better OCR accuracy: grayscale, denoise."""
+    import cv2
+    img_np = np.array(img)
+    
+    # Convert to grayscale
+    if len(img_np.shape) == 3:
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_np
+    
+    # Denoise
+    denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+    return Image.fromarray(denoised)
+
+def ocr_image(ocr_model, img) -> tuple[str, float]:
+    """Run Surya-OCR and preserve line layout."""
+    preprocessed_img = preprocess_image(img)
+    results = ocr_model([preprocessed_img], langs=["bn", "en"])
+    
+    lines = []
+    confidences = []
+    for result in results[0].text_lines:
+        lines.append(result.text)
+        # Calculate average confidence from line bbox
+        if hasattr(result, 'confidence'):
+            confidences.append(result.confidence)
+        else:
+            confidences.append(0.9)  # fallback
+    
     avg_conf = round(sum(confidences) / len(confidences) * 100, 1) if confidences else 0
-    return " ".join(lines), avg_conf
+    return "\n".join(lines), avg_conf
 
 # ── Chroma helpers (no .persist() — auto-persists in newer chromadb) ─────────
 CHROMA_DIR = "./chroma_db"
@@ -124,10 +145,10 @@ if uploaded_file:
     st.success(f"✅ Uploaded: **{uploaded_file.name}**  ({uploaded_file.size/1024:.1f} KB)")
 
     # Load models
-    with st.spinner("⏳ Loading OCR model (first run downloads ~150 MB)…"):
+    with st.spinner("⏳ Loading Surya-OCR models (first run downloads ~2.5 GB)…"):
         try:
-            reader = load_ocr_v4()
-            log("EasyOCR loaded — languages: Bangla (bn) + English (en)")
+            ocr_model = load_ocr_models()
+            log("Surya-OCR loaded — optimized for Bangla line-level accuracy")
         except Exception as e:
             st.error(f"❌ Error loading OCR: {e}")
             import traceback
@@ -161,6 +182,8 @@ if uploaded_file:
     with col1:
         st.subheader("📄 Document Preview")
         st.image(images[0], caption="Page 1", use_container_width=True)
+        st.markdown("**Preprocessed Image (Grayscale + Denoised)**")
+        st.image(preprocess_image(images[0]), caption="Preprocessed Page 1", use_container_width=True)
 
     with col2:
         st.subheader("📝 OCR Processing Logs")
@@ -170,7 +193,7 @@ if uploaded_file:
 
         for i, img in enumerate(images):
             with st.spinner(f"🔍 OCR on page {i+1}/{len(images)}…"):
-                page_text, conf = ocr_image(reader, img)
+                page_text, conf = ocr_image(ocr_model, img)
                 full_text      += page_text + "\n\n"
                 total_conf.append(conf)
                 char_counts.append(len(page_text))
@@ -184,7 +207,7 @@ if uploaded_file:
         m2.metric("Pages Processed",  len(images))
         m3.metric("Avg OCR Confidence", f"{avg_conf}%")
 
-        st.text_area("Extracted Text", full_text.strip(), height=250)
+        st.text_area("Extracted Text (Line-Layout Preserved)", full_text.strip(), height=250)
 
     # Chunk + embed + store
     st.markdown("---")

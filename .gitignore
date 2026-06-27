@@ -16,8 +16,6 @@ __pycache__/
 # Vector store and OCR models
 chroma_db/
 easyocr_models/
-
-# Huggingface cache
 .cache/
 
 # IDE
