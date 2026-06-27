@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  local-rag:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./chroma_db:/app/chroma_db
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_SERVER_ENABLECORS=false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
