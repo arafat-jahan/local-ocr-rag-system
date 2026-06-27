@@ -4,6 +4,12 @@ import os
 from PIL import Image
 import shutil
 from collections import defaultdict
+import sys
+import io
+
+# Fix Windows encoding issue
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Set page config FIRST!
 st.set_page_config(page_title="Local Multilingual RAG", layout="wide")
